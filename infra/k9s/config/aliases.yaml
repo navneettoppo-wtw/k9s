@@ -1,0 +1,38 @@
+# K9s Shared Aliases
+# Target location: ~/.config/k9s/aliases.yaml
+# Usage: type the alias in K9s command bar (e.g. :dp)
+
+aliases:
+  # Workloads
+  dp: apps/v1/deployments
+  sts: apps/v1/statefulsets
+  ds: apps/v1/daemonsets
+  rs: apps/v1/replicasets
+  po: v1/pods
+  jo: batch/v1/jobs
+  cj: batch/v1/cronjobs
+
+  # Networking
+  svc: v1/services
+  ep: v1/endpoints
+  ing: networking.k8s.io/v1/ingresses
+  np: networking.k8s.io/v1/networkpolicies
+
+  # Config & Storage
+  cm: v1/configmaps
+  sec: v1/secrets
+  pvc: v1/persistentvolumeclaims
+  pv: v1/persistentvolumes
+  sc: storage.k8s.io/v1/storageclasses
+
+  # RBAC
+  sa: v1/serviceaccounts
+  rb: rbac.authorization.k8s.io/v1/rolebindings
+  cr: rbac.authorization.k8s.io/v1/clusterroles
+  crb: rbac.authorization.k8s.io/v1/clusterrolebindings
+
+  # Cluster
+  no: v1/nodes
+  ns: v1/namespaces
+  ev: v1/events
+  hpa: autoscaling/v2/horizontalpodautoscalers

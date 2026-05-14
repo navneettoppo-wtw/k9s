@@ -1,0 +1,53 @@
+# K9s Shared Base Configuration
+# Version pinned: v0.32.7
+# Target location: ~/.config/k9s/config.yaml
+
+k9s:
+  # Refresh interval in seconds
+  refreshRate: 2
+
+  # Max log lines to tail
+  maxConnRetry: 5
+  readOnly: false
+  noExitOnCtrlC: false
+  ui:
+    enableMouse: false
+    headless: false
+    logoless: false
+    crumbsless: false
+    reactive: false
+    noIcons: false
+    # Skin/theme — place skin file at ~/.config/k9s/skins/
+    skin: default
+
+  # Default log settings
+  logger:
+    tail: 200
+    buffer: 5000
+    sinceSeconds: -1
+    fullScreenLogs: false
+    textWrap: false
+    showTime: false
+
+  # Default namespace on startup (empty = all namespaces)
+  defaultView: ""
+
+  # Shell to use for pod exec
+  shellPod:
+    image: busybox:1.36
+    namespace: default
+    limits:
+      cpu: 100m
+      memory: 100Mi
+
+  # Screen dumps path
+  screenDumpDir: /tmp/k9s-screens
+
+  # Cluster connection thresholds
+  thresholds:
+    cpu:
+      critical: 90
+      warn: 70
+    memory:
+      critical: 90
+      warn: 70

@@ -1,0 +1,35 @@
+# infra/k9s/local-cluster/docker-compose.yml
+# Spins up a single-node k3s cluster in Docker for local development.
+# Prerequisites: Docker Desktop (macOS/Windows) or Docker Engine (Linux)
+# Usage: see bootstrap.sh or README.md
+
+version: "3.9"
+
+services:
+  k3s-server:
+    image: rancher/k3s:v1.29.4-k3s1
+    container_name: k3s-local
+    privileged: true
+    restart: unless-stopped
+    command:
+      - server
+      - --disable=traefik          # lighter footprint for local dev
+      - --tls-san=127.0.0.1
+      - --node-name=local-node
+    environment:
+      - K3S_KUBECONFIG_OUTPUT=/output/kubeconfig.yaml
+      - K3S_KUBECONFIG_MODE=644
+    volumes:
+      - k3s-server:/var/lib/rancher/k3s
+      - ./kubeconfig:/output          # kubeconfig written here by k3s
+    ports:
+      - "6443:6443"                   # Kubernetes API server
+    healthcheck:
+      test: ["CMD", "k3s", "kubectl", "get", "--raw", "/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  k3s-server:

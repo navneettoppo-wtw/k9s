@@ -1,0 +1,55 @@
+# K9s Shared Hotkeys
+# Target location: ~/.config/k9s/hotkeys.yaml
+# Hotkeys are global and active across all resource views.
+
+hotKeys:
+  # Jump directly to common views
+  shift-0:
+    shortCut: Shift-0
+    description: All namespaces
+    command: namespaces
+
+  shift-1:
+    shortCut: Shift-1
+    description: View pods
+    command: pods
+
+  shift-2:
+    shortCut: Shift-2
+    description: View deployments
+    command: deployments
+
+  shift-3:
+    shortCut: Shift-3
+    description: View services
+    command: services
+
+  shift-4:
+    shortCut: Shift-4
+    description: View configmaps
+    command: configmaps
+
+  shift-5:
+    shortCut: Shift-5
+    description: View secrets
+    command: secrets
+
+  shift-6:
+    shortCut: Shift-6
+    description: View nodes
+    command: nodes
+
+  shift-7:
+    shortCut: Shift-7
+    description: View events
+    command: events
+
+  shift-8:
+    shortCut: Shift-8
+    description: View ingresses
+    command: ingresses
+
+  shift-9:
+    shortCut: Shift-9
+    description: Context switcher
+    command: ctx
