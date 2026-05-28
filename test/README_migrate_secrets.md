@@ -21,7 +21,41 @@ Migrates GitHub Actions secrets, variables, and environment secrets/variables be
 
 ---
 
-## Idempotency rule
+## How secret values are migrated
+
+GitHub's API **never exposes secret values** — this is an intentional security design. The script works around this by reading values directly from Azure Key Vault.
+
+```
+Source GitHub org          Azure Key Vault           Dest GitHub org
+──────────────────         ───────────────           ───────────────
+MY_DATABASE_PASSWORD  →→→  my-database-password  →→→  MY_DATABASE_PASSWORD
+API_KEY               →→→  api-key               →→→  API_KEY
+JWT_SECRET            →→→  jwt-secret            →→→  JWT_SECRET
+```
+
+**No manual export needed.** The script:
+1. Reads the secret **name** from the source GitHub org/repo/environment
+2. Looks up the **value** from Key Vault using the normalised name (`MY_SECRET` → `my-secret`)
+3. Sets the secret with that value in the destination
+
+### What if a secret is not in Key Vault?
+
+If a secret exists in GitHub but has no matching entry in Key Vault, it is flagged as `manual_required` in the CSV report and skipped. This means the secret was originally set directly in GitHub without being stored in Key Vault.
+
+Fix: add it to Key Vault, then re-run. The script is idempotent and will only process what is missing or newer.
+
+```bash
+az keyvault secret set \
+  --vault-name my-keyvault \
+  --name my-database-password \
+  --value "actual-secret-value"
+
+./migrate_secrets.sh   # re-run — only processes flagged items
+```
+
+---
+
+
 
 If a secret or variable already exists in the destination and its `updated_at` timestamp is **equal to or newer** than the source, it is skipped. Nothing is ever deleted.
 
@@ -278,6 +312,38 @@ source_updated_at, dest_updated_at, action, status, notes
 
 ## Design principles
 
+### Files
+
+| File | Purpose |
+|---|---|
+| `migrate_secrets.sh` | Migration script — Linux / macOS (bash) |
+| `migrate_secrets.ps1` | Migration script — Windows (PowerShell) |
+| `README_migrate_secrets.md` | This documentation |
+
+### What the scripts do
+
+- Migrate org-level, repo-level, and environment secrets and variables between two GitHub organisations
+- Read secret values directly from Azure Key Vault — no manual export needed
+- Idempotent — skip anything where the destination is newer; never delete anything
+- Run all pre-flight checks before touching anything — abort immediately on any failure
+- Produce a timestamped CSV audit report and log file on every run
+
+### Quick start
+
+```bash
+# 1. Edit the CONFIG block — set SOURCE_ORG, DEST_ORG, KEY_VAULT_NAME, REPO_MAP
+# 2. Dry run first
+DRY_RUN=true ./migrate_secrets.sh
+# 3. Review the CSV report, then run for real
+./migrate_secrets.sh
+```
+
+```powershell
+# PowerShell
+.\migrate_secrets.ps1 -DryRun   # preview
+.\migrate_secrets.ps1            # real run
+```
+
 - **No deletions** — never removes anything from source or destination
 - **Placeholder guard** — fails immediately if config values are still set to defaults
 - **Idempotent** — safe to re-run; skips up-to-date items
@@ -285,3 +351,39 @@ source_updated_at, dest_updated_at, action, status, notes
 - **Fail-safe** — per-item errors use `continue`, not `exit`; the full run always completes
 - **Verify after write** — environment variables are re-read after setting to confirm
 - **GitHub Enterprise Server support** — set `GH_API_HOST` / `$GhApiHost` to your GHES URL
+
+---
+
+## Summary
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `migrate_secrets.sh` | Migration script — Linux / macOS (bash) |
+| `migrate_secrets.ps1` | Migration script — Windows (PowerShell) |
+| `README_migrate_secrets.md` | This documentation |
+
+### What the scripts do
+
+- Migrate org-level, repo-level, and environment secrets and variables between two GitHub organisations
+- Read secret values directly from Azure Key Vault — no manual export needed
+- Idempotent — skip anything where the destination is newer; never delete anything
+- Run all pre-flight checks before touching anything — abort immediately on any failure
+- Produce a timestamped CSV audit report and log file on every run
+
+### Quick start
+
+```bash
+# 1. Edit the CONFIG block — set SOURCE_ORG, DEST_ORG, KEY_VAULT_NAME, REPO_MAP
+# 2. Dry run first
+DRY_RUN=true ./migrate_secrets.sh
+# 3. Review the CSV report, then run for real
+./migrate_secrets.sh
+```
+
+```powershell
+# PowerShell
+.\migrate_secrets.ps1 -DryRun   # preview
+.\migrate_secrets.ps1            # real run
+```
