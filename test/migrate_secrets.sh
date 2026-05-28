@@ -51,29 +51,70 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ==============================================================================
-# CONFIG — edit these before running
+# ██  CONFIG — edit this section before running
 # ==============================================================================
-SOURCE_ORG="${SOURCE_ORG:-source-org-name}"
-DEST_ORG="${DEST_ORG:-dest-org-name}"
 
-# Azure Key Vault name — leave empty to flag secrets for manual entry instead
-KEY_VAULT_NAME="${KEY_VAULT_NAME:-}"
+# GitHub API — default is public GitHub. For GitHub Enterprise Server change to:
+#   GH_API_HOST="https://github.mycompany.com"  (then gh uses that host automatically)
+GH_API_HOST="https://api.github.com"
 
-# Repos to migrate — leave empty to auto-discover all repos in SOURCE_ORG
-REPOS=()
-# REPOS=("repo-one" "repo-two")
+SOURCE_ORG="source-org-name"       # GitHub org to migrate FROM
+DEST_ORG="dest-org-name"           # GitHub org to migrate TO
+KEY_VAULT_NAME=""                  # Azure Key Vault name (leave empty to flag secrets manually)
+DRY_RUN="false"                    # Set to "true" to preview without writing
 
-# Environments to migrate per repo — leave empty to auto-discover
+# ------------------------------------------------------------------------------
+# REPO MAP — source repo name → destination repo name
+# ------------------------------------------------------------------------------
+# Leave empty declare -A REPO_MAP=() to auto-discover ALL repos in SOURCE_ORG
+# (destination repo name is assumed to be the same as source)
+#
+# Single repo — same name in both orgs:
+#   declare -A REPO_MAP=(["my-api"]="my-api")
+#
+# Single repo — renamed in destination org:
+#   declare -A REPO_MAP=(["old-service"]="new-service")
+#
+# Multiple repos — same names:
+#   declare -A REPO_MAP=(
+#     ["repo-one"]="repo-one"
+#     ["repo-two"]="repo-two"
+#     ["repo-three"]="repo-three"
+#   )
+#
+# Multiple repos — mixed (some renamed, some not):
+#   declare -A REPO_MAP=(
+#     ["auth-service"]="auth-service"
+#     ["legacy-api"]="modern-api"
+#     ["data-pipeline"]="data-pipeline"
+#   )
+declare -A REPO_MAP=(
+  # ["my-api"]="my-api"
+  # ["old-service"]="new-service"
+)
+
+# ------------------------------------------------------------------------------
+# ENVIRONMENTS — leave empty to auto-discover all environments per repo
+# ------------------------------------------------------------------------------
+# Single environment:
+#   ENVIRONMENTS=("production")
+#
+# Multiple environments:
+#   ENVIRONMENTS=("development" "staging" "production")
 ENVIRONMENTS=()
 # ENVIRONMENTS=("production" "staging")
 
-# Set to "true" to preview without writing anything
-DRY_RUN="${DRY_RUN:-false}"
+# ==============================================================================
 
 # Output files (timestamped to avoid overwriting previous runs)
 _TS="$(date -u +%Y%m%d_%H%M%S)"
 REPORT_FILE="migration_report_${_TS}.csv"
 LOG_FILE="migration_${_TS}.log"
+
+# Export GH_HOST so every gh CLI call in this script uses the configured API host
+# For public GitHub this is "github.com"; strip the https:// prefix gh expects
+export GH_HOST="${GH_API_HOST#https://}"
+export GH_HOST="${GH_HOST#http://}"
 # ==============================================================================
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -169,6 +210,12 @@ https://cli.github.com/packages stable main" \
 }
 
 check_prereqs() {
+  # Guard against unconfigured placeholders
+  if [[ "$SOURCE_ORG" == "source-org-name" || "$DEST_ORG" == "dest-org-name" ]]; then
+    Write-Error "SOURCE_ORG / DEST_ORG are still set to placeholder values. Edit the CONFIG block first."
+    exit 1
+  fi
+
   Write-Step "Pre-flight checks"
 
   command -v gh      &>/dev/null || _install_gh
@@ -311,11 +358,11 @@ migrate_org_variables() {
 # REPO-LEVEL SECRETS
 # ==============================================================================
 migrate_repo_secrets() {
-  local repo="$1"
-  Write-Info "Repo secrets: $repo"
+  local src_repo="$1" dst_repo="$2"
+  Write-Info "Repo secrets: $src_repo → $dst_repo"
 
   local secrets
-  secrets=$(gh api "repos/$SOURCE_ORG/$repo/actions/secrets" --paginate --jq '.secrets[]' 2>/dev/null || true)
+  secrets=$(gh api "repos/$SOURCE_ORG/$src_repo/actions/secrets" --paginate --jq '.secrets[]' 2>/dev/null || true)
   [[ -z "$secrets" ]] && return
 
   while IFS= read -r secret; do
@@ -323,12 +370,12 @@ migrate_repo_secrets() {
     name=$(echo "$secret"   | jq -r '.name')
     src_ts=$(echo "$secret" | jq -r '.updated_at // .created_at')
 
-    dst_meta=$(get_secret_meta "repos/$DEST_ORG/$repo/actions/secrets/$name")
+    dst_meta=$(get_secret_meta "repos/$DEST_ORG/$dst_repo/actions/secrets/$name")
     dst_ts=$(echo "$dst_meta" | jq -r '.updated_at // .created_at // empty')
 
     if [[ -n "$dst_ts" ]] && ! src_is_newer "$src_ts" "$dst_ts"; then
-      Write-Warn "REPO SECRET [$repo/$name] — dest newer, skipping"
-      csv_row "repo" "$repo" "" "secret" "$name" "$src_ts" "$dst_ts" "skip" "skipped" "dest newer or equal"
+      Write-Warn "REPO SECRET [$src_repo/$name] — dest newer, skipping"
+      csv_row "repo" "$src_repo→$dst_repo" "" "secret" "$name" "$src_ts" "$dst_ts" "skip" "skipped" "dest newer or equal"
       continue
     fi
 
@@ -336,25 +383,25 @@ migrate_repo_secrets() {
     secret_value=$(get_kv_secret "$name")
 
     if [[ -z "$secret_value" ]]; then
-      Write-Warn "REPO SECRET [$repo/$name] — flagged for manual migration"
+      Write-Warn "REPO SECRET [$src_repo/$name] — flagged for manual migration"
       local notes="Not found in Key Vault '${KEY_VAULT_NAME:-none}' — set manually"
       [[ "$DRY_RUN" == "true" ]] && notes="[DRY RUN] would flag for manual migration"
-      csv_row "repo" "$repo" "" "secret" "$name" "$src_ts" "$dst_ts" "manual_required" "flagged" "$notes"
+      csv_row "repo" "$src_repo→$dst_repo" "" "secret" "$name" "$src_ts" "$dst_ts" "manual_required" "flagged" "$notes"
       continue
     fi
 
     [[ "$DRY_RUN" == "true" ]] && {
-      Write-Info "REPO SECRET [$repo/$name] [DRY RUN] would migrate from Key Vault"
-      csv_row "repo" "$repo" "" "secret" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" "value from Key Vault"
+      Write-Info "REPO SECRET [$src_repo/$name] [DRY RUN] would migrate from Key Vault"
+      csv_row "repo" "$src_repo→$dst_repo" "" "secret" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" "value from Key Vault"
       continue
     }
 
-    if gh secret set "$name" --repo "$DEST_ORG/$repo" --body "$secret_value" &>/dev/null; then
-      Write-Success "REPO SECRET [$repo/$name] migrated from Key Vault"
-      csv_row "repo" "$repo" "" "secret" "$name" "$src_ts" "$dst_ts" "migrated" "success" "value from Key Vault"
+    if gh secret set "$name" --repo "$DEST_ORG/$dst_repo" --body "$secret_value" &>/dev/null; then
+      Write-Success "REPO SECRET [$src_repo/$name] migrated → $dst_repo"
+      csv_row "repo" "$src_repo→$dst_repo" "" "secret" "$name" "$src_ts" "$dst_ts" "migrated" "success" "value from Key Vault"
     else
-      Write-Error "REPO SECRET [$repo/$name] — failed to set"
-      csv_row "repo" "$repo" "" "secret" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
+      Write-Error "REPO SECRET [$src_repo/$name] — failed to set"
+      csv_row "repo" "$src_repo→$dst_repo" "" "secret" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
     fi
   done <<< "$(echo "$secrets" | jq -c '.')"
 }
@@ -363,11 +410,11 @@ migrate_repo_secrets() {
 # REPO-LEVEL VARIABLES
 # ==============================================================================
 migrate_repo_variables() {
-  local repo="$1"
-  Write-Info "Repo variables: $repo"
+  local src_repo="$1" dst_repo="$2"
+  Write-Info "Repo variables: $src_repo → $dst_repo"
 
   local vars
-  vars=$(gh api "repos/$SOURCE_ORG/$repo/actions/variables" --paginate --jq '.variables[]' 2>/dev/null || true)
+  vars=$(gh api "repos/$SOURCE_ORG/$src_repo/actions/variables" --paginate --jq '.variables[]' 2>/dev/null || true)
   [[ -z "$vars" ]] && return
 
   while IFS= read -r var; do
@@ -376,30 +423,30 @@ migrate_repo_variables() {
     value=$(echo "$var"  | jq -r '.value')
     src_ts=$(echo "$var" | jq -r '.updated_at // .created_at')
 
-    dst_var=$(gh api "repos/$DEST_ORG/$repo/actions/variables/$name" 2>/dev/null || echo "null")
+    dst_var=$(gh api "repos/$DEST_ORG/$dst_repo/actions/variables/$name" 2>/dev/null || echo "null")
     dst_ts=$(echo "$dst_var" | jq -r '.updated_at // .created_at // empty' 2>/dev/null || true)
 
     if [[ -n "$dst_ts" ]] && ! src_is_newer "$src_ts" "$dst_ts"; then
-      Write-Warn "REPO VAR [$repo/$name] — dest newer, skipping"
-      csv_row "repo" "$repo" "" "variable" "$name" "$src_ts" "$dst_ts" "skip" "skipped" "dest newer or equal"
+      Write-Warn "REPO VAR [$src_repo/$name] — dest newer, skipping"
+      csv_row "repo" "$src_repo→$dst_repo" "" "variable" "$name" "$src_ts" "$dst_ts" "skip" "skipped" "dest newer or equal"
       continue
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-      Write-Info "REPO VAR [$repo/$name] [DRY RUN] would migrate"
-      csv_row "repo" "$repo" "" "variable" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" ""
+      Write-Info "REPO VAR [$src_repo/$name] [DRY RUN] would migrate"
+      csv_row "repo" "$src_repo→$dst_repo" "" "variable" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" ""
       continue
     fi
 
-    local method="POST" endpoint="repos/$DEST_ORG/$repo/actions/variables"
-    [[ "$dst_var" != "null" ]] && { method="PATCH"; endpoint="repos/$DEST_ORG/$repo/actions/variables/$name"; }
+    local method="POST" endpoint="repos/$DEST_ORG/$dst_repo/actions/variables"
+    [[ "$dst_var" != "null" ]] && { method="PATCH"; endpoint="repos/$DEST_ORG/$dst_repo/actions/variables/$name"; }
 
     if gh api --method "$method" "$endpoint" -f name="$name" -f value="$value" &>/dev/null; then
-      Write-Success "REPO VAR [$repo/$name] migrated"
-      csv_row "repo" "$repo" "" "variable" "$name" "$src_ts" "$dst_ts" "migrated" "success" ""
+      Write-Success "REPO VAR [$src_repo/$name] migrated → $dst_repo"
+      csv_row "repo" "$src_repo→$dst_repo" "" "variable" "$name" "$src_ts" "$dst_ts" "migrated" "success" ""
     else
-      Write-Error "REPO VAR [$repo/$name] — API call failed"
-      csv_row "repo" "$repo" "" "variable" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
+      Write-Error "REPO VAR [$src_repo/$name] — API call failed"
+      csv_row "repo" "$src_repo→$dst_repo" "" "variable" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
     fi
   done <<< "$(echo "$vars" | jq -c '.')"
 }
@@ -409,16 +456,16 @@ migrate_repo_variables() {
 # ENVIRONMENT SECRETS
 # ==============================================================================
 migrate_env_secrets() {
-  local repo="$1" env="$2"
+  local src_repo="$1" dst_repo="$2" env="$3"
 
   local src_id dst_id
-  src_id=$(gh api "repos/$SOURCE_ORG/$repo" --jq '.id' 2>/dev/null || true)
-  [[ -z "$src_id" ]] && { Write-Error "Cannot get repo ID for $SOURCE_ORG/$repo"; return; }
+  src_id=$(gh api "repos/$SOURCE_ORG/$src_repo" --jq '.id' 2>/dev/null || true)
+  [[ -z "$src_id" ]] && { Write-Error "Cannot get repo ID for $SOURCE_ORG/$src_repo"; return; }
 
-  dst_id=$(gh api "repos/$DEST_ORG/$repo" --jq '.id' 2>/dev/null || true)
-  [[ -z "$dst_id" ]] && { Write-Warn "Dest repo $DEST_ORG/$repo not found — skipping env secrets for $env"; return; }
+  dst_id=$(gh api "repos/$DEST_ORG/$dst_repo" --jq '.id' 2>/dev/null || true)
+  [[ -z "$dst_id" ]] && { Write-Warn "Dest repo $DEST_ORG/$dst_repo not found — skipping env secrets for $env"; return; }
 
-  Write-Info "Env secrets: $repo/$env"
+  Write-Info "Env secrets: $src_repo/$env → $dst_repo/$env"
   local secrets
   secrets=$(gh api "repositories/$src_id/environments/$env/secrets" --paginate --jq '.secrets[]' 2>/dev/null || true)
   [[ -z "$secrets" ]] && return
@@ -432,8 +479,8 @@ migrate_env_secrets() {
     dst_ts=$(echo "$dst_meta" | jq -r '.updated_at // .created_at // empty')
 
     if [[ -n "$dst_ts" ]] && ! src_is_newer "$src_ts" "$dst_ts"; then
-      Write-Warn "ENV SECRET [$repo/$env/$name] — dest newer, skipping"
-      csv_row "environment" "$repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "skip" "skipped" "dest newer or equal"
+      Write-Warn "ENV SECRET [$src_repo/$env/$name] — dest newer, skipping"
+      csv_row "environment" "$src_repo→$dst_repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "skip" "skipped" "dest newer or equal"
       continue
     fi
 
@@ -441,25 +488,25 @@ migrate_env_secrets() {
     secret_value=$(get_kv_secret "$name")
 
     if [[ -z "$secret_value" ]]; then
-      Write-Warn "ENV SECRET [$repo/$env/$name] — flagged for manual migration"
+      Write-Warn "ENV SECRET [$src_repo/$env/$name] — flagged for manual migration"
       local notes="Not found in Key Vault '${KEY_VAULT_NAME:-none}' — set manually"
       [[ "$DRY_RUN" == "true" ]] && notes="[DRY RUN] would flag for manual migration"
-      csv_row "environment" "$repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "manual_required" "flagged" "$notes"
+      csv_row "environment" "$src_repo→$dst_repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "manual_required" "flagged" "$notes"
       continue
     fi
 
     [[ "$DRY_RUN" == "true" ]] && {
-      Write-Info "ENV SECRET [$repo/$env/$name] [DRY RUN] would migrate from Key Vault"
-      csv_row "environment" "$repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" "value from Key Vault"
+      Write-Info "ENV SECRET [$src_repo/$env/$name] [DRY RUN] would migrate from Key Vault"
+      csv_row "environment" "$src_repo→$dst_repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" "value from Key Vault"
       continue
     }
 
-    if gh secret set "$name" --repo "$DEST_ORG/$repo" --env "$env" --body "$secret_value" &>/dev/null; then
-      Write-Success "ENV SECRET [$repo/$env/$name] migrated from Key Vault"
-      csv_row "environment" "$repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "migrated" "success" "value from Key Vault"
+    if gh secret set "$name" --repo "$DEST_ORG/$dst_repo" --env "$env" --body "$secret_value" &>/dev/null; then
+      Write-Success "ENV SECRET [$src_repo/$env/$name] migrated → $dst_repo"
+      csv_row "environment" "$src_repo→$dst_repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "migrated" "success" "value from Key Vault"
     else
-      Write-Error "ENV SECRET [$repo/$env/$name] — failed to set"
-      csv_row "environment" "$repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
+      Write-Error "ENV SECRET [$src_repo/$env/$name] — failed to set"
+      csv_row "environment" "$src_repo→$dst_repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
     fi
   done <<< "$(echo "$secrets" | jq -c '.')"
 }
@@ -468,16 +515,16 @@ migrate_env_secrets() {
 # ENVIRONMENT VARIABLES
 # ==============================================================================
 migrate_env_variables() {
-  local repo="$1" env="$2"
+  local src_repo="$1" dst_repo="$2" env="$3"
 
   local src_id dst_id
-  src_id=$(gh api "repos/$SOURCE_ORG/$repo" --jq '.id' 2>/dev/null || true)
+  src_id=$(gh api "repos/$SOURCE_ORG/$src_repo" --jq '.id' 2>/dev/null || true)
   [[ -z "$src_id" ]] && return
 
-  dst_id=$(gh api "repos/$DEST_ORG/$repo" --jq '.id' 2>/dev/null || true)
-  [[ -z "$dst_id" ]] && { Write-Warn "Dest repo $DEST_ORG/$repo not found — skipping env vars for $env"; return; }
+  dst_id=$(gh api "repos/$DEST_ORG/$dst_repo" --jq '.id' 2>/dev/null || true)
+  [[ -z "$dst_id" ]] && { Write-Warn "Dest repo $DEST_ORG/$dst_repo not found — skipping env vars for $env"; return; }
 
-  Write-Info "Env variables: $repo/$env"
+  Write-Info "Env variables: $src_repo/$env → $dst_repo/$env"
   local vars
   vars=$(gh api "repositories/$src_id/environments/$env/variables" --paginate --jq '.variables[]' 2>/dev/null || true)
   [[ -z "$vars" ]] && return
@@ -492,14 +539,14 @@ migrate_env_variables() {
     dst_ts=$(echo "$dst_var" | jq -r '.updated_at // .created_at // empty' 2>/dev/null || true)
 
     if [[ -n "$dst_ts" ]] && ! src_is_newer "$src_ts" "$dst_ts"; then
-      Write-Warn "ENV VAR [$repo/$env/$name] — dest newer, skipping"
-      csv_row "environment" "$repo" "$env" "variable" "$name" "$src_ts" "$dst_ts" "skip" "skipped" "dest newer or equal"
+      Write-Warn "ENV VAR [$src_repo/$env/$name] — dest newer, skipping"
+      csv_row "environment" "$src_repo→$dst_repo" "$env" "variable" "$name" "$src_ts" "$dst_ts" "skip" "skipped" "dest newer or equal"
       continue
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-      Write-Info "ENV VAR [$repo/$env/$name] [DRY RUN] would migrate"
-      csv_row "environment" "$repo" "$env" "variable" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" ""
+      Write-Info "ENV VAR [$src_repo/$env/$name] [DRY RUN] would migrate"
+      csv_row "environment" "$src_repo→$dst_repo" "$env" "variable" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" ""
       continue
     fi
 
@@ -507,19 +554,18 @@ migrate_env_variables() {
     [[ "$dst_var" != "null" ]] && { method="PATCH"; endpoint="repositories/$dst_id/environments/$env/variables/$name"; }
 
     if gh api --method "$method" "$endpoint" -f name="$name" -f value="$value" &>/dev/null; then
-      # Verify the variable is now present (mirrors PS1 verify-after-write pattern)
       local verified
       verified=$(gh api "repositories/$dst_id/environments/$env/variables/$name" --jq '.name' 2>/dev/null || true)
       if [[ "$verified" == "$name" ]]; then
-        Write-Success "ENV VAR [$repo/$env/$name] migrated and verified ✅"
-        csv_row "environment" "$repo" "$env" "variable" "$name" "$src_ts" "$dst_ts" "migrated" "success" "verified"
+        Write-Success "ENV VAR [$src_repo/$env/$name] migrated and verified ✅ → $dst_repo"
+        csv_row "environment" "$src_repo→$dst_repo" "$env" "variable" "$name" "$src_ts" "$dst_ts" "migrated" "success" "verified"
       else
-        Write-Warn "ENV VAR [$repo/$env/$name] set but could not be verified ⚠️"
-        csv_row "environment" "$repo" "$env" "variable" "$name" "$src_ts" "$dst_ts" "migrated" "unverified" "set but verify failed"
+        Write-Warn "ENV VAR [$src_repo/$env/$name] set but could not be verified ⚠️"
+        csv_row "environment" "$src_repo→$dst_repo" "$env" "variable" "$name" "$src_ts" "$dst_ts" "migrated" "unverified" "set but verify failed"
       fi
     else
-      Write-Error "ENV VAR [$repo/$env/$name] — API call failed"
-      csv_row "environment" "$repo" "$env" "variable" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
+      Write-Error "ENV VAR [$src_repo/$env/$name] — API call failed"
+      csv_row "environment" "$src_repo→$dst_repo" "$env" "variable" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
     fi
   done <<< "$(echo "$vars" | jq -c '.')"
 }
@@ -528,11 +574,11 @@ migrate_env_variables() {
 # ENVIRONMENT DISCOVERY
 # ==============================================================================
 get_environments() {
-  local repo="$1"
+  local src_repo="$1"
   if [[ ${#ENVIRONMENTS[@]} -gt 0 ]]; then
     printf '%s\n' "${ENVIRONMENTS[@]}"
   else
-    gh api "repos/$SOURCE_ORG/$repo/environments" --paginate --jq '.environments[].name' 2>/dev/null || true
+    gh api "repos/$SOURCE_ORG/$src_repo/environments" --paginate --jq '.environments[].name' 2>/dev/null || true
   fi
 }
 
@@ -546,6 +592,7 @@ main() {
   echo "║   GitHub Secrets & Variables Migration — 2026 Edition       ║"
   echo "╚══════════════════════════════════════════════════════════════╝"
   echo -e "${RESET}"
+  echo "    GitHub API : $GH_API_HOST"
   echo "    Source org : $SOURCE_ORG"
   echo "    Dest org   : $DEST_ORG"
   echo "    Key Vault  : ${KEY_VAULT_NAME:-(none — secrets flagged for manual entry)}"
@@ -568,29 +615,34 @@ main() {
 
   # ── Repo level ─────────────────────────────────────────────────────────────
   Write-Step "Repo-level migration"
-  local repo_list=()
-  if [[ ${#REPOS[@]} -gt 0 ]]; then
-    repo_list=("${REPOS[@]}")
+
+  # Build src→dst pairs from REPO_MAP, or auto-discover (same name in both orgs)
+  declare -A effective_map
+  if [[ ${#REPO_MAP[@]} -gt 0 ]]; then
+    for src_repo in "${!REPO_MAP[@]}"; do
+      effective_map["$src_repo"]="${REPO_MAP[$src_repo]}"
+    done
   else
     Write-Info "Auto-discovering repos in $SOURCE_ORG..."
-    while IFS= read -r r; do [[ -n "$r" ]] && repo_list+=("$r"); done < <(
-      gh api "orgs/$SOURCE_ORG/repos" --paginate --jq '.[].name' 2>/dev/null || true
-    )
+    while IFS= read -r r; do
+      [[ -n "$r" ]] && effective_map["$r"]="$r"
+    done < <(gh api "orgs/$SOURCE_ORG/repos" --paginate --jq '.[].name' 2>/dev/null || true)
   fi
 
-  for repo in "${repo_list[@]}"; do
-    echo -e "\n    ${GRAY}---  $repo  ---${RESET}" | tee -a "$LOG_FILE"
-    migrate_repo_secrets   "$repo"
-    migrate_repo_variables "$repo"
+  for src_repo in "${!effective_map[@]}"; do
+    local dst_repo="${effective_map[$src_repo]}"
+    echo -e "\n    ${GRAY}---  $src_repo → $dst_repo  ---${RESET}" | tee -a "$LOG_FILE"
+    migrate_repo_secrets   "$src_repo" "$dst_repo"
+    migrate_repo_variables "$src_repo" "$dst_repo"
 
     while IFS= read -r env; do
       [[ -z "$env" ]] && continue
-      migrate_env_secrets   "$repo" "$env"
-      migrate_env_variables "$repo" "$env"
-    done < <(get_environments "$repo")
+      migrate_env_secrets   "$src_repo" "$dst_repo" "$env"
+      migrate_env_variables "$src_repo" "$dst_repo" "$env"
+    done < <(get_environments "$src_repo")
   done
 
-  # ── Summary (mirrors PS1 summary + next-steps block) ──────────────────────
+  # ── Summary ────────────────────────────────────────────────────────────────
   local total skipped migrated flagged failed
   total=$(tail -n +2 "$REPORT_FILE" | wc -l)
   skipped=$(grep -c '"skipped"'      "$REPORT_FILE" || true)
@@ -616,8 +668,8 @@ main() {
   echo "  - Open $REPORT_FILE in Excel / Google Sheets for the full audit trail"
   echo "  - For every row with status=flagged, manually set the secret value in:"
   echo "    https://github.com/orgs/$DEST_ORG/settings/secrets/actions"
-  for repo in "${repo_list[@]}"; do
-    echo "    https://github.com/$DEST_ORG/$repo/settings/secrets/actions"
+  for dst_repo in "${effective_map[@]}"; do
+    echo "    https://github.com/$DEST_ORG/$dst_repo/settings/secrets/actions"
   done
   if [[ "$flagged" -gt 0 ]]; then
     echo ""

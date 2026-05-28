@@ -52,29 +52,75 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
-    [string] $SourceOrg,
-
-    [Parameter(Mandatory)]
-    [string] $DestOrg,
-
-    [string[]] $Repos        = @(),
-    [string[]] $Environments = @(),
-
-    # Azure Key Vault name to resolve secret values from (e.g. "my-keyvault")
-    # If omitted, secrets are flagged for manual entry as before.
-    [string] $KeyVaultName   = "",
-
-    [switch] $DryRun
+    [switch] $DryRun   # Pass -DryRun to preview without writing anything
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# ==============================================================================
+# ██  CONFIG — edit this section before running
+# ==============================================================================
+
+# GitHub API — default is public GitHub. For GitHub Enterprise Server change to:
+#   $GhApiHost = "https://github.mycompany.com"
+$GhApiHost     = "https://api.github.com"
+
+$SourceOrg     = "source-org-name"    # GitHub org to migrate FROM
+$DestOrg       = "dest-org-name"      # GitHub org to migrate TO
+$KeyVaultName  = ""                   # Azure Key Vault name (leave empty to flag secrets manually)
+
+# ------------------------------------------------------------------------------
+# REPO MAP — source repo name → destination repo name
+# ------------------------------------------------------------------------------
+# Leave empty @{} to auto-discover ALL repos in $SourceOrg
+# (destination repo name is assumed to be the same as source)
+#
+# Single repo — same name in both orgs:
+#   $RepoMap = @{ "my-api" = "my-api" }
+#
+# Single repo — renamed in destination org:
+#   $RepoMap = @{ "old-service" = "new-service" }
+#
+# Multiple repos — same names:
+#   $RepoMap = [ordered]@{
+#       "repo-one"   = "repo-one"
+#       "repo-two"   = "repo-two"
+#       "repo-three" = "repo-three"
+#   }
+#
+# Multiple repos — mixed (some renamed, some not):
+#   $RepoMap = [ordered]@{
+#       "auth-service"  = "auth-service"
+#       "legacy-api"    = "modern-api"
+#       "data-pipeline" = "data-pipeline"
+#   }
+$RepoMap = [ordered]@{
+    # "my-api"      = "my-api"
+    # "old-service" = "new-service"
+}
+
+# ------------------------------------------------------------------------------
+# ENVIRONMENTS — leave empty @() to auto-discover all environments per repo
+# ------------------------------------------------------------------------------
+# Single environment:
+#   $Environments = @("production")
+#
+# Multiple environments:
+#   $Environments = @("development", "staging", "production")
+$Environments = @()
+# $Environments = @("production", "staging")
+
+# ==============================================================================
+
 # ── Timestamps ────────────────────────────────────────────────────────────────
 $_ts        = (Get-Date -Format "yyyyMMdd_HHmmss")
 $ReportFile = "migration_report_$_ts.csv"
 $LogFile    = "migration_$_ts.log"
+
+# Set GH_HOST so every gh CLI call uses the configured API host
+# gh expects just the hostname, not the full URL
+$env:GH_HOST = $GhApiHost -replace '^https?://', ''
 
 # ── Logging helpers ───────────────────────────────────────────────────────────
 function Write-Step([string]$msg) {
@@ -164,6 +210,12 @@ function Get-KvSecret([string]$secretName) {
 # PRE-FLIGHT
 # ==============================================================================
 function Invoke-PreflightChecks {
+    # Guard against unconfigured placeholders
+    if ($SourceOrg -eq "source-org-name" -or $DestOrg -eq "dest-org-name") {
+        Write-Err "SourceOrg / DestOrg are still set to placeholder values. Edit the CONFIG block first."
+        exit 1
+    }
+
     Write-Step "Pre-flight checks"
 
     # Auto-install gh CLI if missing
@@ -269,6 +321,11 @@ function Invoke-OrgSecrets {
             Write-Err "ORG SECRET [$name] — failed to set in $DestOrg"
             Add-CsvRow "org" "" "" "secret" $name $srcTs $dstTs "migrate" "failed" "API error"
         }
+    }
+}
+
+# ==============================================================================
+# ORG-LEVEL VARIABLES
 # ==============================================================================
 function Invoke-OrgVariables {
     Write-Step "Org variables: $SourceOrg → $DestOrg"
@@ -315,22 +372,22 @@ function Invoke-OrgVariables {
 # ==============================================================================
 # REPO-LEVEL SECRETS
 # ==============================================================================
-function Invoke-RepoSecrets([string]$repo) {
-    Write-Info "Repo secrets: $repo"
+function Invoke-RepoSecrets([string]$srcRepo, [string]$dstRepo) {
+    Write-Info "Repo secrets: $srcRepo → $dstRepo"
 
-    $secrets = gh api "repos/$SourceOrg/$repo/actions/secrets" --paginate --jq '.secrets[]' 2>$null | ConvertFrom-Json
+    $secrets = gh api "repos/$SourceOrg/$srcRepo/actions/secrets" --paginate --jq '.secrets[]' 2>$null | ConvertFrom-Json
     if (-not $secrets) { return }
 
     foreach ($secret in @($secrets)) {
         $name  = $secret.name
         $srcTs = if ($secret.updated_at) { $secret.updated_at } else { $secret.created_at }
 
-        $dstMeta = Get-SecretMeta "repos/$DestOrg/$repo/actions/secrets/$name"
+        $dstMeta = Get-SecretMeta "repos/$DestOrg/$dstRepo/actions/secrets/$name"
         $dstTs   = Get-SecretTs $dstMeta
 
         if ($dstTs -and -not (Test-SrcIsNewer $srcTs $dstTs)) {
-            Write-Warn "REPO SECRET [$repo/$name] — dest newer, skipping"
-            Add-CsvRow "repo" $repo "" "secret" $name $srcTs $dstTs "skip" "skipped" "dest newer or equal"
+            Write-Warn "REPO SECRET [$srcRepo/$name] — dest newer, skipping"
+            Add-CsvRow "repo" "$srcRepo→$dstRepo" "" "secret" $name $srcTs $dstTs "skip" "skipped" "dest newer or equal"
             continue
         }
 
@@ -338,22 +395,22 @@ function Invoke-RepoSecrets([string]$repo) {
         if ($null -eq $secretValue) {
             $action = if ($DryRun) { "dry_run" } else { "manual_required" }
             $notes  = if ($DryRun) { "[DRY RUN] would flag for manual migration" } else { "Not found in Key Vault '$KeyVaultName' — set manually" }
-            Write-Warn "REPO SECRET [$repo/$name] — flagged for manual migration"
-            Add-CsvRow "repo" $repo "" "secret" $name $srcTs $dstTs $action "flagged" $notes
+            Write-Warn "REPO SECRET [$srcRepo/$name] — flagged for manual migration"
+            Add-CsvRow "repo" "$srcRepo→$dstRepo" "" "secret" $name $srcTs $dstTs $action "flagged" $notes
             continue
         }
         if ($DryRun) {
-            Write-Info "REPO SECRET [$repo/$name] [DRY RUN] would migrate from Key Vault"
-            Add-CsvRow "repo" $repo "" "secret" $name $srcTs $dstTs "dry_run" "would_migrate" "value from Key Vault"
+            Write-Info "REPO SECRET [$srcRepo/$name] [DRY RUN] would migrate from Key Vault"
+            Add-CsvRow "repo" "$srcRepo→$dstRepo" "" "secret" $name $srcTs $dstTs "dry_run" "would_migrate" "value from Key Vault"
             continue
         }
-        gh secret set $name --repo "$DestOrg/$repo" --body $secretValue | Out-Null
+        gh secret set $name --repo "$DestOrg/$dstRepo" --body $secretValue | Out-Null
         if ($LASTEXITCODE -eq 0) {
-            Write-Success "REPO SECRET [$repo/$name] migrated from Key Vault"
-            Add-CsvRow "repo" $repo "" "secret" $name $srcTs $dstTs "migrated" "success" "value from Key Vault"
+            Write-Success "REPO SECRET [$srcRepo/$name] migrated → $dstRepo"
+            Add-CsvRow "repo" "$srcRepo→$dstRepo" "" "secret" $name $srcTs $dstTs "migrated" "success" "value from Key Vault"
         } else {
-            Write-Err "REPO SECRET [$repo/$name] — failed to set"
-            Add-CsvRow "repo" $repo "" "secret" $name $srcTs $dstTs "migrate" "failed" "API error"
+            Write-Err "REPO SECRET [$srcRepo/$name] — failed to set"
+            Add-CsvRow "repo" "$srcRepo→$dstRepo" "" "secret" $name $srcTs $dstTs "migrate" "failed" "API error"
         }
     }
 }
@@ -361,10 +418,10 @@ function Invoke-RepoSecrets([string]$repo) {
 # ==============================================================================
 # REPO-LEVEL VARIABLES
 # ==============================================================================
-function Invoke-RepoVariables([string]$repo) {
-    Write-Info "Repo variables: $repo"
+function Invoke-RepoVariables([string]$srcRepo, [string]$dstRepo) {
+    Write-Info "Repo variables: $srcRepo → $dstRepo"
 
-    $vars = gh api "repos/$SourceOrg/$repo/actions/variables" --paginate --jq '.variables[]' 2>$null | ConvertFrom-Json
+    $vars = gh api "repos/$SourceOrg/$srcRepo/actions/variables" --paginate --jq '.variables[]' 2>$null | ConvertFrom-Json
     if (-not $vars) { return }
 
     foreach ($var in @($vars)) {
@@ -372,32 +429,32 @@ function Invoke-RepoVariables([string]$repo) {
         $value = $var.value
         $srcTs = if ($var.updated_at) { $var.updated_at } else { $var.created_at }
 
-        $dstVar = gh api "repos/$DestOrg/$repo/actions/variables/$name" 2>$null | ConvertFrom-Json
+        $dstVar = gh api "repos/$DestOrg/$dstRepo/actions/variables/$name" 2>$null | ConvertFrom-Json
         $dstTs  = if ($dstVar -and $dstVar.updated_at) { $dstVar.updated_at } `
                   elseif ($dstVar -and $dstVar.created_at) { $dstVar.created_at } else { "" }
 
         if ($dstTs -and -not (Test-SrcIsNewer $srcTs $dstTs)) {
-            Write-Warn "REPO VAR [$repo/$name] — dest newer, skipping"
-            Add-CsvRow "repo" $repo "" "variable" $name $srcTs $dstTs "skip" "skipped" "dest newer or equal"
+            Write-Warn "REPO VAR [$srcRepo/$name] — dest newer, skipping"
+            Add-CsvRow "repo" "$srcRepo→$dstRepo" "" "variable" $name $srcTs $dstTs "skip" "skipped" "dest newer or equal"
             continue
         }
 
         if ($DryRun) {
-            Write-Info "REPO VAR [$repo/$name] [DRY RUN] would migrate"
-            Add-CsvRow "repo" $repo "" "variable" $name $srcTs $dstTs "dry_run" "would_migrate" ""
+            Write-Info "REPO VAR [$srcRepo/$name] [DRY RUN] would migrate"
+            Add-CsvRow "repo" "$srcRepo→$dstRepo" "" "variable" $name $srcTs $dstTs "dry_run" "would_migrate" ""
             continue
         }
 
         $method   = if ($dstVar) { "PATCH" } else { "POST" }
-        $endpoint = if ($dstVar) { "repos/$DestOrg/$repo/actions/variables/$name" } else { "repos/$DestOrg/$repo/actions/variables" }
+        $endpoint = if ($dstVar) { "repos/$DestOrg/$dstRepo/actions/variables/$name" } else { "repos/$DestOrg/$dstRepo/actions/variables" }
 
         gh api --method $method $endpoint -f name="$name" -f value="$value" | Out-Null
         if ($LASTEXITCODE -eq 0) {
-            Write-Success "REPO VAR [$repo/$name] migrated"
-            Add-CsvRow "repo" $repo "" "variable" $name $srcTs $dstTs "migrated" "success" ""
+            Write-Success "REPO VAR [$srcRepo/$name] migrated → $dstRepo"
+            Add-CsvRow "repo" "$srcRepo→$dstRepo" "" "variable" $name $srcTs $dstTs "migrated" "success" ""
         } else {
-            Write-Err "REPO VAR [$repo/$name] — API call failed"
-            Add-CsvRow "repo" $repo "" "variable" $name $srcTs $dstTs "migrate" "failed" "API error"
+            Write-Err "REPO VAR [$srcRepo/$name] — API call failed"
+            Add-CsvRow "repo" "$srcRepo→$dstRepo" "" "variable" $name $srcTs $dstTs "migrate" "failed" "API error"
         }
     }
 }
@@ -405,14 +462,14 @@ function Invoke-RepoVariables([string]$repo) {
 # ==============================================================================
 # ENVIRONMENT SECRETS
 # ==============================================================================
-function Invoke-EnvSecrets([string]$repo, [string]$env) {
-    $srcId = gh api "repos/$SourceOrg/$repo" --jq '.id' 2>$null
-    if (-not $srcId) { Write-Err "Cannot get repo ID for $SourceOrg/$repo"; return }
+function Invoke-EnvSecrets([string]$srcRepo, [string]$dstRepo, [string]$env) {
+    $srcId = gh api "repos/$SourceOrg/$srcRepo" --jq '.id' 2>$null
+    if (-not $srcId) { Write-Err "Cannot get repo ID for $SourceOrg/$srcRepo"; return }
 
-    $dstId = gh api "repos/$DestOrg/$repo" --jq '.id' 2>$null
-    if (-not $dstId) { Write-Warn "Dest repo $DestOrg/$repo not found — skipping env secrets for $env"; return }
+    $dstId = gh api "repos/$DestOrg/$dstRepo" --jq '.id' 2>$null
+    if (-not $dstId) { Write-Warn "Dest repo $DestOrg/$dstRepo not found — skipping env secrets for $env"; return }
 
-    Write-Info "Env secrets: $repo/$env"
+    Write-Info "Env secrets: $srcRepo/$env → $dstRepo/$env"
     $secrets = gh api "repositories/$srcId/environments/$env/secrets" --paginate --jq '.secrets[]' 2>$null | ConvertFrom-Json
     if (-not $secrets) { return }
 
@@ -424,8 +481,8 @@ function Invoke-EnvSecrets([string]$repo, [string]$env) {
         $dstTs   = Get-SecretTs $dstMeta
 
         if ($dstTs -and -not (Test-SrcIsNewer $srcTs $dstTs)) {
-            Write-Warn "ENV SECRET [$repo/$env/$name] — dest newer, skipping"
-            Add-CsvRow "environment" $repo $env "secret" $name $srcTs $dstTs "skip" "skipped" "dest newer or equal"
+            Write-Warn "ENV SECRET [$srcRepo/$env/$name] — dest newer, skipping"
+            Add-CsvRow "environment" "$srcRepo→$dstRepo" $env "secret" $name $srcTs $dstTs "skip" "skipped" "dest newer or equal"
             continue
         }
 
@@ -433,22 +490,22 @@ function Invoke-EnvSecrets([string]$repo, [string]$env) {
         if ($null -eq $secretValue) {
             $action = if ($DryRun) { "dry_run" } else { "manual_required" }
             $notes  = if ($DryRun) { "[DRY RUN] would flag for manual migration" } else { "Not found in Key Vault '$KeyVaultName' — set manually" }
-            Write-Warn "ENV SECRET [$repo/$env/$name] — flagged for manual migration"
-            Add-CsvRow "environment" $repo $env "secret" $name $srcTs $dstTs $action "flagged" $notes
+            Write-Warn "ENV SECRET [$srcRepo/$env/$name] — flagged for manual migration"
+            Add-CsvRow "environment" "$srcRepo→$dstRepo" $env "secret" $name $srcTs $dstTs $action "flagged" $notes
             continue
         }
         if ($DryRun) {
-            Write-Info "ENV SECRET [$repo/$env/$name] [DRY RUN] would migrate from Key Vault"
-            Add-CsvRow "environment" $repo $env "secret" $name $srcTs $dstTs "dry_run" "would_migrate" "value from Key Vault"
+            Write-Info "ENV SECRET [$srcRepo/$env/$name] [DRY RUN] would migrate from Key Vault"
+            Add-CsvRow "environment" "$srcRepo→$dstRepo" $env "secret" $name $srcTs $dstTs "dry_run" "would_migrate" "value from Key Vault"
             continue
         }
-        gh secret set $name --repo "$DestOrg/$repo" --env $env --body $secretValue | Out-Null
+        gh secret set $name --repo "$DestOrg/$dstRepo" --env $env --body $secretValue | Out-Null
         if ($LASTEXITCODE -eq 0) {
-            Write-Success "ENV SECRET [$repo/$env/$name] migrated from Key Vault"
-            Add-CsvRow "environment" $repo $env "secret" $name $srcTs $dstTs "migrated" "success" "value from Key Vault"
+            Write-Success "ENV SECRET [$srcRepo/$env/$name] migrated → $dstRepo"
+            Add-CsvRow "environment" "$srcRepo→$dstRepo" $env "secret" $name $srcTs $dstTs "migrated" "success" "value from Key Vault"
         } else {
-            Write-Err "ENV SECRET [$repo/$env/$name] — failed to set"
-            Add-CsvRow "environment" $repo $env "secret" $name $srcTs $dstTs "migrate" "failed" "API error"
+            Write-Err "ENV SECRET [$srcRepo/$env/$name] — failed to set"
+            Add-CsvRow "environment" "$srcRepo→$dstRepo" $env "secret" $name $srcTs $dstTs "migrate" "failed" "API error"
         }
     }
 }
@@ -456,14 +513,14 @@ function Invoke-EnvSecrets([string]$repo, [string]$env) {
 # ==============================================================================
 # ENVIRONMENT VARIABLES
 # ==============================================================================
-function Invoke-EnvVariables([string]$repo, [string]$env) {
-    $srcId = gh api "repos/$SourceOrg/$repo" --jq '.id' 2>$null
+function Invoke-EnvVariables([string]$srcRepo, [string]$dstRepo, [string]$env) {
+    $srcId = gh api "repos/$SourceOrg/$srcRepo" --jq '.id' 2>$null
     if (-not $srcId) { return }
 
-    $dstId = gh api "repos/$DestOrg/$repo" --jq '.id' 2>$null
-    if (-not $dstId) { Write-Warn "Dest repo $DestOrg/$repo not found — skipping env vars for $env"; return }
+    $dstId = gh api "repos/$DestOrg/$dstRepo" --jq '.id' 2>$null
+    if (-not $dstId) { Write-Warn "Dest repo $DestOrg/$dstRepo not found — skipping env vars for $env"; return }
 
-    Write-Info "Env variables: $repo/$env"
+    Write-Info "Env variables: $srcRepo/$env → $dstRepo/$env"
     $vars = gh api "repositories/$srcId/environments/$env/variables" --paginate --jq '.variables[]' 2>$null | ConvertFrom-Json
     if (-not $vars) { return }
 
@@ -477,14 +534,14 @@ function Invoke-EnvVariables([string]$repo, [string]$env) {
                   elseif ($dstVar -and $dstVar.created_at) { $dstVar.created_at } else { "" }
 
         if ($dstTs -and -not (Test-SrcIsNewer $srcTs $dstTs)) {
-            Write-Warn "ENV VAR [$repo/$env/$name] — dest newer, skipping"
-            Add-CsvRow "environment" $repo $env "variable" $name $srcTs $dstTs "skip" "skipped" "dest newer or equal"
+            Write-Warn "ENV VAR [$srcRepo/$env/$name] — dest newer, skipping"
+            Add-CsvRow "environment" "$srcRepo→$dstRepo" $env "variable" $name $srcTs $dstTs "skip" "skipped" "dest newer or equal"
             continue
         }
 
         if ($DryRun) {
-            Write-Info "ENV VAR [$repo/$env/$name] [DRY RUN] would migrate"
-            Add-CsvRow "environment" $repo $env "variable" $name $srcTs $dstTs "dry_run" "would_migrate" ""
+            Write-Info "ENV VAR [$srcRepo/$env/$name] [DRY RUN] would migrate"
+            Add-CsvRow "environment" "$srcRepo→$dstRepo" $env "variable" $name $srcTs $dstTs "dry_run" "would_migrate" ""
             continue
         }
 
@@ -494,18 +551,17 @@ function Invoke-EnvVariables([string]$repo, [string]$env) {
 
         gh api --method $method $endpoint -f name="$name" -f value="$value" | Out-Null
         if ($LASTEXITCODE -eq 0) {
-            # Verify after write (mirrors addAppSecretToEnvs.ps1 pattern)
             $verified = gh api "repositories/$dstId/environments/$env/variables/$name" --jq '.name' 2>$null
             if ($verified -eq $name) {
-                Write-Success "ENV VAR [$repo/$env/$name] migrated and verified ✅"
-                Add-CsvRow "environment" $repo $env "variable" $name $srcTs $dstTs "migrated" "success" "verified"
+                Write-Success "ENV VAR [$srcRepo/$env/$name] migrated and verified ✅ → $dstRepo"
+                Add-CsvRow "environment" "$srcRepo→$dstRepo" $env "variable" $name $srcTs $dstTs "migrated" "success" "verified"
             } else {
-                Write-Warn "ENV VAR [$repo/$env/$name] set but could not be verified ⚠️"
-                Add-CsvRow "environment" $repo $env "variable" $name $srcTs $dstTs "migrated" "unverified" "set but verify failed"
+                Write-Warn "ENV VAR [$srcRepo/$env/$name] set but could not be verified ⚠️"
+                Add-CsvRow "environment" "$srcRepo→$dstRepo" $env "variable" $name $srcTs $dstTs "migrated" "unverified" "set but verify failed"
             }
         } else {
-            Write-Err "ENV VAR [$repo/$env/$name] — API call failed"
-            Add-CsvRow "environment" $repo $env "variable" $name $srcTs $dstTs "migrate" "failed" "API error"
+            Write-Err "ENV VAR [$srcRepo/$env/$name] — API call failed"
+            Add-CsvRow "environment" "$srcRepo→$dstRepo" $env "variable" $name $srcTs $dstTs "migrate" "failed" "API error"
         }
     }
 }
@@ -513,9 +569,9 @@ function Invoke-EnvVariables([string]$repo, [string]$env) {
 # ==============================================================================
 # ENVIRONMENT DISCOVERY
 # ==============================================================================
-function Get-RepoEnvironments([string]$repo) {
+function Get-RepoEnvironments([string]$srcRepo) {
     if ($Environments.Count -gt 0) { return $Environments }
-    $envs = gh api "repos/$SourceOrg/$repo/environments" --paginate --jq '.environments[].name' 2>$null
+    $envs = gh api "repos/$SourceOrg/$srcRepo/environments" --paginate --jq '.environments[].name' 2>$null
     return $envs | Where-Object { $_ }
 }
 
@@ -527,6 +583,7 @@ Write-Host "╔═════════════════════�
 Write-Host "║   GitHub Secrets & Variables Migration — 2026 Edition       ║" -ForegroundColor Cyan
 Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
+Write-Host "    GitHub API : $GhApiHost"
 Write-Host "    Source org : $SourceOrg"
 Write-Host "    Dest org   : $DestOrg"
 Write-Host "    Key Vault  : $(if ($KeyVaultName) { $KeyVaultName } else { '(none — secrets flagged for manual entry)' })"
@@ -551,33 +608,37 @@ Invoke-OrgVariables
 # ── Repo level ────────────────────────────────────────────────────────────────
 Write-Step "Repo-level migration"
 
-$repoList = if ($Repos.Count -gt 0) {
-    $Repos
+# Build effective src→dst map from $RepoMap, or auto-discover (same name in both orgs)
+$effectiveMap = [ordered]@{}
+if ($RepoMap.Count -gt 0) {
+    foreach ($key in $RepoMap.Keys) { $effectiveMap[$key] = $RepoMap[$key] }
 } else {
     Write-Info "Auto-discovering repos in $SourceOrg..."
-    gh api "orgs/$SourceOrg/repos" --paginate --jq '.[].name' 2>$null | Where-Object { $_ }
+    $discovered = gh api "orgs/$SourceOrg/repos" --paginate --jq '.[].name' 2>$null | Where-Object { $_ }
+    foreach ($r in $discovered) { $effectiveMap[$r] = $r }
 }
 
-foreach ($repo in $repoList) {
-    Write-Host "`n    --- $repo ---" -ForegroundColor Gray
-    Add-Content $LogFile "`n    --- $repo ---"
+foreach ($srcRepo in $effectiveMap.Keys) {
+    $dstRepo = $effectiveMap[$srcRepo]
+    Write-Host "`n    --- $srcRepo → $dstRepo ---" -ForegroundColor Gray
+    Add-Content $LogFile "`n    --- $srcRepo → $dstRepo ---"
 
-    Invoke-RepoSecrets   $repo
-    Invoke-RepoVariables $repo
+    Invoke-RepoSecrets   $srcRepo $dstRepo
+    Invoke-RepoVariables $srcRepo $dstRepo
 
-    foreach ($env in (Get-RepoEnvironments $repo)) {
-        Invoke-EnvSecrets   $repo $env
-        Invoke-EnvVariables $repo $env
+    foreach ($env in (Get-RepoEnvironments $srcRepo)) {
+        Invoke-EnvSecrets   $srcRepo $dstRepo $env
+        Invoke-EnvVariables $srcRepo $dstRepo $env
     }
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 $rows     = Import-Csv $ReportFile
 $total    = $rows.Count
-$migrated = ($rows | Where-Object { $_.status -eq "success"      }).Count
-$skipped  = ($rows | Where-Object { $_.status -eq "skipped"      }).Count
-$flagged  = ($rows | Where-Object { $_.status -eq "flagged"      }).Count
-$failed   = ($rows | Where-Object { $_.status -eq "failed"       }).Count
+$migrated = ($rows | Where-Object { $_.status -eq "success"  }).Count
+$skipped  = ($rows | Where-Object { $_.status -eq "skipped"  }).Count
+$flagged  = ($rows | Where-Object { $_.status -eq "flagged"  }).Count
+$failed   = ($rows | Where-Object { $_.status -eq "failed"   }).Count
 
 Write-Host ""
 Write-Host "==================================================" -ForegroundColor Cyan
@@ -597,8 +658,8 @@ Write-Host "Next steps:" -ForegroundColor Cyan
 Write-Host "  - Open $ReportFile in Excel for the full audit trail"
 Write-Host "  - For every row with status=flagged, manually set the secret value in:"
 Write-Host "    https://github.com/orgs/$DestOrg/settings/secrets/actions"
-foreach ($repo in $repoList) {
-    Write-Host "    https://github.com/$DestOrg/$repo/settings/secrets/actions"
+foreach ($dstRepo in $effectiveMap.Values) {
+    Write-Host "    https://github.com/$DestOrg/$dstRepo/settings/secrets/actions"
 }
 
 if ($flagged -gt 0) {

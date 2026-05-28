@@ -98,31 +98,65 @@ az keyvault secret list --vault-name my-keyvault --query "[].name" -o tsv
 
 ## Configuration
 
+All settings live in the `CONFIG` block at the top of each script. Edit before running — no command-line arguments needed.
+
 ### Bash (`migrate_secrets.sh`)
 
-Edit the `CONFIG` block at the top, or pass as environment variables:
-
 ```bash
-SOURCE_ORG="source-org-name"
-DEST_ORG="dest-org-name"
-KEY_VAULT_NAME="my-keyvault"   # leave empty to flag secrets for manual entry
+GH_API_HOST="https://api.github.com"   # change for GitHub Enterprise Server
 
-REPOS=()                        # leave empty to auto-discover all repos
-ENVIRONMENTS=()                 # leave empty to auto-discover all environments
-DRY_RUN="false"
+SOURCE_ORG="source-org-name"           # org to migrate FROM
+DEST_ORG="dest-org-name"               # org to migrate TO
+KEY_VAULT_NAME="my-keyvault"           # leave empty to flag secrets for manual entry
+DRY_RUN="false"                        # set to "true" to preview without writing
+
+# Single repo — same name in both orgs:
+declare -A REPO_MAP=(["my-api"]="my-api")
+
+# Single repo — renamed in destination:
+declare -A REPO_MAP=(["old-service"]="new-service")
+
+# Multiple repos:
+declare -A REPO_MAP=(
+  ["repo-one"]="repo-one"
+  ["repo-two"]="repo-two"
+  ["legacy-api"]="modern-api"
+)
+
+# Leave empty to auto-discover ALL repos (same name assumed in dest org):
+declare -A REPO_MAP=()
+
+# Environments (leave empty to auto-discover all):
+ENVIRONMENTS=("production" "staging")
 ```
 
 ### PowerShell (`migrate_secrets.ps1`)
 
-All settings are parameters:
-
 ```powershell
--SourceOrg      "source-org-name"
--DestOrg        "dest-org-name"
--KeyVaultName   "my-keyvault"     # omit to flag secrets for manual entry
--Repos          @("repo-one", "repo-two")       # omit to auto-discover
--Environments   @("production", "staging")      # omit to auto-discover
--DryRun                                         # switch, omit for real run
+$GhApiHost    = "https://api.github.com"   # change for GitHub Enterprise Server
+
+$SourceOrg    = "source-org-name"
+$DestOrg      = "dest-org-name"
+$KeyVaultName = "my-keyvault"              # leave empty to flag secrets for manual entry
+
+# Single repo — same name:
+$RepoMap = @{ "my-api" = "my-api" }
+
+# Single repo — renamed:
+$RepoMap = @{ "old-service" = "new-service" }
+
+# Multiple repos:
+$RepoMap = [ordered]@{
+    "repo-one"   = "repo-one"
+    "repo-two"   = "repo-two"
+    "legacy-api" = "modern-api"
+}
+
+# Leave empty to auto-discover ALL repos:
+$RepoMap = @{}
+
+# Environments (leave empty to auto-discover all):
+$Environments = @("production", "staging")
 ```
 
 ---
@@ -136,6 +170,7 @@ When the script starts it runs **all pre-flight checks first**, before creating 
 ║   GitHub Secrets & Variables Migration — 2026 Edition       ║
 ╚══════════════════════════════════════════════════════════════╝
 
+    GitHub API : https://api.github.com
     Source org : source-org
     Dest org   : dest-org
     Key Vault  : my-keyvault
@@ -156,14 +191,15 @@ When the script starts it runs **all pre-flight checks first**, before creating 
 
 Pre-flight checks (in order):
 
-1. `gh` CLI installed (auto-installs if missing)
-2. `gh` CLI authenticated to GitHub
-3. `az` CLI installed and authenticated *(only when Key Vault name is set)*
-4. Key Vault accessible *(only when Key Vault name is set)*
-5. Source org reachable via API
-6. Destination org reachable via API
+1. Config placeholders replaced (fails immediately if `source-org-name` / `dest-org-name` still set)
+2. `gh` CLI installed (auto-installs if missing)
+3. `gh` CLI authenticated to GitHub
+4. `az` CLI installed and authenticated *(only when Key Vault name is set)*
+5. Key Vault accessible *(only when Key Vault name is set)*
+6. Source org reachable via API
+7. Destination org reachable via API
 
-**Nothing is written — no CSV, no secrets, no variables — until all six checks pass.**
+**Nothing is written — no CSV, no secrets, no variables — until all checks pass.**
 
 ---
 
@@ -173,20 +209,20 @@ Pre-flight checks (in order):
 
 ```bash
 # Always dry-run first
-DRY_RUN=true KEY_VAULT_NAME=my-keyvault ./migrate_secrets.sh
+DRY_RUN=true ./migrate_secrets.sh
 
 # Real run
-KEY_VAULT_NAME=my-keyvault ./migrate_secrets.sh
+./migrate_secrets.sh
 ```
 
 ### PowerShell
 
 ```powershell
 # Always dry-run first
-.\migrate_secrets.ps1 -SourceOrg "source-org" -DestOrg "dest-org" -KeyVaultName "my-keyvault" -DryRun
+.\migrate_secrets.ps1 -DryRun
 
 # Real run
-.\migrate_secrets.ps1 -SourceOrg "source-org" -DestOrg "dest-org" -KeyVaultName "my-keyvault"
+.\migrate_secrets.ps1
 ```
 
 ---
@@ -220,6 +256,16 @@ source_updated_at, dest_updated_at, action, status, notes
 
 ---
 
+## Known limitations
+
+| Limitation | Impact | Mitigation |
+|---|---|---|
+| GitHub API rate limit (5000 req/hr) | Large orgs with 100s of repos may hit the limit mid-run | Re-run — idempotency means it resumes safely |
+| Org secret visibility (`selected` repos) | Visibility is copied but the selected-repo list is not — migrated org secrets default to `all` | Manually restrict visibility in dest org after migration |
+| Key Vault naming mismatch | `MY_SECRET` → `my-secret` normalisation may not match your KV convention | Check KV names before running; mismatches appear as `flagged` in CSV |
+
+---
+
 ## After the migration
 
 1. Open the CSV report and filter `status = flagged`
@@ -233,7 +279,9 @@ source_updated_at, dest_updated_at, action, status, notes
 ## Design principles
 
 - **No deletions** — never removes anything from source or destination
+- **Placeholder guard** — fails immediately if config values are still set to defaults
 - **Idempotent** — safe to re-run; skips up-to-date items
 - **Key Vault integration** — secret values resolved automatically; falls back to flagging if not found
 - **Fail-safe** — per-item errors use `continue`, not `exit`; the full run always completes
 - **Verify after write** — environment variables are re-read after setting to confirm
+- **GitHub Enterprise Server support** — set `GH_API_HOST` / `$GhApiHost` to your GHES URL
