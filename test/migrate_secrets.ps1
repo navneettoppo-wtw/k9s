@@ -62,8 +62,8 @@ $ErrorActionPreference = "Stop"
 # ██  CONFIG — edit this section before running
 # ==============================================================================
 
-# GitHub API — default is public GitHub. For GitHub Enterprise Server change to:
-#   $GhApiHost = "https://github.mycompany.com"
+# GitHub API — no change needed for public GitHub (github.com)
+# Only change this if using GitHub Enterprise Server: "https://github.mycompany.com"
 $GhApiHost     = "https://api.github.com"
 
 $SourceOrg     = "source-org-name"    # GitHub org to migrate FROM

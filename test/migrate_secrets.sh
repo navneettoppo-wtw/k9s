@@ -54,8 +54,8 @@ IFS=$'\n\t'
 # ██  CONFIG — edit this section before running
 # ==============================================================================
 
-# GitHub API — default is public GitHub. For GitHub Enterprise Server change to:
-#   GH_API_HOST="https://github.mycompany.com"  (then gh uses that host automatically)
+# GitHub API — no change needed for public GitHub (github.com)
+# Only change this if using GitHub Enterprise Server: "https://github.mycompany.com"
 GH_API_HOST="https://api.github.com"
 
 SOURCE_ORG="source-org-name"       # GitHub org to migrate FROM

@@ -137,7 +137,7 @@ All settings live in the `CONFIG` block at the top of each script. Edit before r
 ### Bash (`migrate_secrets.sh`)
 
 ```bash
-GH_API_HOST="https://api.github.com"   # change for GitHub Enterprise Server
+GH_API_HOST="https://api.github.com"   # no change needed for public GitHub
 
 SOURCE_ORG="source-org-name"           # org to migrate FROM
 DEST_ORG="dest-org-name"               # org to migrate TO
@@ -167,7 +167,7 @@ ENVIRONMENTS=("production" "staging")
 ### PowerShell (`migrate_secrets.ps1`)
 
 ```powershell
-$GhApiHost    = "https://api.github.com"   # change for GitHub Enterprise Server
+$GhApiHost    = "https://api.github.com"   # no change needed for public GitHub
 
 $SourceOrg    = "source-org-name"
 $DestOrg      = "dest-org-name"
